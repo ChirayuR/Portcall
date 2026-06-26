@@ -1,9 +1,9 @@
-use serialport::{ErrorKind, SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
+use serialport::{ClearBuffer, ErrorKind, SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_BAUD: u32 = 115_200;
 /// How long a read blocks before returning `TimedOut`. Short enough that the
@@ -11,6 +11,20 @@ const DEFAULT_BAUD: u32 = 115_200;
 /// busy-spin.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const READ_BUF: usize = 1024;
+
+/// Baud rates the auto-detector scans, low → high (standard set + fast links).
+const BAUD_CANDIDATES: &[u32] = &[
+    9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
+];
+/// How long to listen at each candidate baud during a scan.
+const DETECT_WINDOW: Duration = Duration::from_millis(350);
+/// Need at least this many bytes in a window to judge a baud at all.
+const DETECT_MIN_BYTES: usize = 8;
+/// Stop a listen window early once we have this many bytes — plenty to score,
+/// and a hard cap against a fast/flooding link ballooning memory.
+const DETECT_MAX_BYTES: usize = 4096;
+/// Minimum text-likeness score (0.0–1.0) for a baud to count as a match.
+const DETECT_THRESHOLD: f32 = 0.85;
 
 fn main() -> ExitCode {
     // Args: `--all`/`-a` shows phantom slots; the first non-flag arg, if any,
@@ -71,7 +85,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let baud = match choose_baud() {
+    let baud = match choose_baud_or_detect(&port_name) {
         Ok(Some(b)) => b,
         Ok(None) => {
             eprintln!("\nNo baud rate — bye.");
@@ -240,6 +254,118 @@ fn choose_baud() -> io::Result<Option<u32>> {
             _ => eprintln!("Enter a positive baud rate (e.g. 9600, 115200)."),
         }
     }
+}
+
+/// Decide the baud rate: ask what the device transmits, then auto-detect for
+/// ASCII (the device must be sending now) or take a manual baud for binary/raw.
+/// Auto-detect failure also falls back to manual entry. `None` = quit (EOF).
+fn choose_baud_or_detect(path: &str) -> io::Result<Option<u32>> {
+    loop {
+        let Some(answer) =
+            prompt("\nWhat is the device sending? [A]SCII text / [B]inary or raw (default A): ")?
+        else {
+            return Ok(None);
+        };
+
+        match answer.to_ascii_lowercase().as_str() {
+            "" | "a" | "ascii" => {
+                eprintln!("Auto-detecting baud — the device must be transmitting ASCII now…");
+                if let Some(baud) = detect_baud(path) {
+                    eprintln!("auto: {baud} baud detected.");
+                    return Ok(Some(baud));
+                }
+                eprintln!(
+                    "Auto-detect failed (no clear signal — is the device sending?). \
+                     Falling back to manual entry."
+                );
+                return choose_baud();
+            }
+            "b" | "binary" | "raw" => return choose_baud(),
+            other => eprintln!("Please answer A or B (got {other:?})."),
+        }
+    }
+}
+
+/// Scan `BAUD_CANDIDATES`, scoring each listen window for ASCII-ness, and return
+/// the best-matching baud (or `None` if nothing scored above threshold). Opens
+/// its own probe port; the caller reopens for the real connection.
+fn detect_baud(path: &str) -> Option<u32> {
+    let mut port = match serialport::new(path, BAUD_CANDIDATES[0])
+        .timeout(READ_TIMEOUT)
+        .open()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("auto-baud: can't open {path}: {e}");
+            return None;
+        }
+    };
+
+    let mut best: Option<(u32, f32, Vec<u8>)> = None;
+    for &baud in BAUD_CANDIDATES {
+        // PTYs reject some rates; a real adapter accepts all standard ones.
+        if port.set_baud_rate(baud).is_err() {
+            continue;
+        }
+        // Discard bytes captured at the previous rate / mid-switch garbage.
+        let _ = port.clear(ClearBuffer::Input);
+
+        let bytes = read_window(&mut *port, DETECT_WINDOW);
+        let score = score_ascii(&bytes);
+        eprintln!("  scan {baud:>7}: {:>4} bytes  score {score:.2}", bytes.len());
+
+        if score >= DETECT_THRESHOLD && best.as_ref().is_none_or(|(_, b, _)| score > *b) {
+            best = Some((baud, score, bytes));
+        }
+    }
+
+    best.map(|(baud, _, sample)| {
+        eprintln!("  best sample: {:?}", sample_preview(&sample));
+        baud
+    })
+}
+
+/// Read from `port` for up to `window`, returning whatever bytes arrived.
+fn read_window<R: io::Read + ?Sized>(port: &mut R, window: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + window;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    while Instant::now() < deadline && out.len() < DETECT_MAX_BYTES {
+        match port.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Rate a sample's "looks like ASCII text" quality from 0.0–1.0. Requires line
+/// structure (`\n`/`\r`) — matching the expectation set at the prompt — so a
+/// coincidentally-clean window at the wrong baud can't win.
+fn score_ascii(bytes: &[u8]) -> f32 {
+    if bytes.len() < DETECT_MIN_BYTES {
+        return 0.0;
+    }
+    let textlike = bytes.iter().filter(|&&b| is_textlike(b)).count();
+    let ratio = textlike as f32 / bytes.len() as f32;
+    let has_line = bytes.iter().any(|&b| b == b'\n' || b == b'\r');
+    if has_line { ratio } else { ratio * 0.5 }
+}
+
+/// Printable ASCII or common whitespace — the bytes we'd expect from text.
+fn is_textlike(b: u8) -> bool {
+    matches!(b, 0x20..=0x7E | b'\t' | b'\n' | b'\r')
+}
+
+/// A short, single-line, printable preview of a sample for display.
+fn sample_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(48)
+        .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '·' })
+        .collect()
 }
 
 /// Is this a phantom legacy UART slot the kernel always exposes even with no
