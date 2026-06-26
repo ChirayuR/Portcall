@@ -1,0 +1,11 @@
+# Local planning notes — keep out of the repo
+notes_portcall.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+
+# Added by cargo
+
+/target
