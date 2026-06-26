@@ -1,53 +1,245 @@
-use serialport::{SerialPortInfo, SerialPortType, UsbPortInfo};
+use serialport::{ErrorKind, SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+const DEFAULT_BAUD: u32 = 115_200;
+/// How long a read blocks before returning `TimedOut`. Short enough that the
+/// reader thread notices a disconnect / shutdown promptly, long enough to not
+/// busy-spin.
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+const READ_BUF: usize = 1024;
 
 fn main() -> ExitCode {
-    // Tiny hand-rolled flag parse (no clap dep yet): --all / -a shows every
-    // port, including the phantom legacy slots we normally hide.
-    let show_all = std::env::args().skip(1).any(|a| a == "--all" || a == "-a");
+    // Args: `--all`/`-a` shows phantom slots; the first non-flag arg, if any,
+    // is a port path to open directly, skipping discovery + the picker. Direct
+    // mode is also what lets us aim portcall at a virtual loopback port (a
+    // socat PTY) to test the stream path without real hardware.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let show_all = args.iter().any(|a| a == "--all" || a == "-a");
+    let explicit_path = args.iter().find(|a| !a.starts_with('-')).cloned();
 
-    // `available_ports()` does the OS-specific discovery and hands back a Vec.
-    // It can fail (e.g. permissions / platform quirks), so it returns a Result.
-    let ports = match serialport::available_ports() {
-        Ok(ports) => ports,
+    let port_name = if let Some(path) = explicit_path {
+        path
+    } else {
+        let ports = match serialport::available_ports() {
+            Ok(ports) => ports,
+            Err(e) => {
+                eprintln!("error: failed to enumerate serial ports: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Hide phantom `/dev/ttyS*` slots unless the user asked for everything.
+        let visible: Vec<&SerialPortInfo> = ports
+            .iter()
+            .filter(|p| show_all || !is_phantom(p))
+            .collect();
+
+        if visible.is_empty() {
+            if ports.is_empty() {
+                println!("No serial ports found.");
+            } else {
+                println!(
+                    "No usable serial ports found ({} phantom slot(s) hidden).\n\
+                     Plug in a device, or pass --all to see everything.",
+                    ports.len()
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
+
+        println!("Found {} serial port(s):\n", visible.len());
+        for (i, port) in visible.iter().enumerate() {
+            println!("  [{}] {}", i + 1, port.port_name);
+            println!("      {}", describe(&port.port_type));
+        }
+
+        // ---- Slice 2: pick a port, open it, stream RX to stdout ----
+        match choose_port(&visible) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                eprintln!("\nNothing selected — bye.");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("input error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let baud = match choose_baud() {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            eprintln!("\nNo baud rate — bye.");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
-            eprintln!("error: failed to enumerate serial ports: {e}");
+            eprintln!("input error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Hide phantom `/dev/ttyS*` slots unless the user asked for everything.
-    // `.collect()` into a Vec of borrows — we don't need to own the infos.
-    let visible: Vec<&SerialPortInfo> = ports
-        .iter()
-        .filter(|p| show_all || !is_phantom(p))
-        .collect();
-
-    if visible.is_empty() {
-        if ports.is_empty() {
-            println!("No serial ports found.");
-        } else {
-            // Everything we found was a phantom slot (else `visible` wouldn't be
-            // empty), so the total count is the hidden count.
-            println!(
-                "No usable serial ports found ({} phantom slot(s) hidden).\n\
-                 Plug in a device, or pass --all to see everything.",
-                ports.len()
-            );
+    let conn = match Connection::open(&port_name, baud) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to open {port_name} @ {baud}: {e}");
+            // The single most common first-run failure on Linux.
+            if e.kind() == ErrorKind::Io(io::ErrorKind::PermissionDenied) {
+                eprintln!(
+                    "hint: add yourself to the 'dialout' group, then log out and back in:\n  \
+                     sudo usermod -aG dialout $USER"
+                );
+            }
+            return ExitCode::FAILURE;
         }
-        return ExitCode::SUCCESS;
+    };
+
+    eprintln!("\nConnected to {port_name} @ {baud} baud. Press Ctrl-C to quit.\n");
+
+    // Stream until the reader thread ends (device error/disconnect) or stdout
+    // breaks. Serial bytes go to stdout; all our chrome went to stderr above.
+    if let Err(e) = conn.pump_to(io::stdout().lock()) {
+        eprintln!("\noutput error: {e}");
+        return ExitCode::FAILURE;
     }
 
-    println!("Found {} serial port(s):\n", visible.len());
-
-    // `enumerate()` pairs each item with its index; we +1 for a human-friendly
-    // 1-based list (this becomes the pick number in Slice 2).
-    for (i, port) in visible.iter().enumerate() {
-        println!("  [{}] {}", i + 1, port.port_name);
-        println!("      {}", describe(&port.port_type));
-    }
-
+    eprintln!("\nDisconnected.");
     ExitCode::SUCCESS
+}
+
+/// A live serial link: owns the background reader thread and the channel it
+/// feeds. This is the seam that becomes the `core` library's `Connection`
+/// later (notes: core has no TUI deps). RX-only for now; TX lands in Slice 4
+/// via `SerialPort::try_clone`.
+struct Connection {
+    rx: mpsc::Receiver<Vec<u8>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Connection {
+    /// Open `path` at `baud`, then hand the port off to a reader thread.
+    fn open(path: &str, baud: u32) -> serialport::Result<Connection> {
+        let port = serialport::new(path, baud).timeout(READ_TIMEOUT).open()?;
+
+        // The channel is the producer/consumer queue: reader thread = producer,
+        // main thread = consumer (cf. an RTOS message queue).
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        // `move` transfers ownership of `port` and `tx` into the thread. After
+        // this, main can't touch `port` — the compiler guarantees the port has
+        // exactly one owner, so there's no data race to reason about.
+        let reader = thread::spawn(move || reader_loop(port, tx));
+
+        Ok(Connection { rx, reader })
+    }
+
+    /// Block, writing each received chunk to `out`, until the channel closes
+    /// (reader thread exits) — then reap the thread.
+    fn pump_to<W: Write>(self, mut out: W) -> io::Result<()> {
+        // Iterating a `Receiver` yields values until every `Sender` is dropped.
+        for chunk in self.rx {
+            out.write_all(&chunk)?;
+            out.flush()?;
+        }
+        // Channel drained & closed ⇒ the reader has returned; join to surface
+        // any panic and avoid a detached thread.
+        let _ = self.reader.join();
+        Ok(())
+    }
+}
+
+/// Producer side: block on the port, push received bytes into the channel.
+/// Owns the port outright (moved in), so no locking is needed.
+fn reader_loop(mut port: Box<dyn SerialPort>, tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; READ_BUF];
+    loop {
+        match port.read(&mut buf) {
+            // The port only reaches `read()` after signalling readable, so 0
+            // bytes here means EOF — the device closed. (Genuine "no data yet"
+            // surfaces as `TimedOut` below.) Stop: closing `tx` ends the stream.
+            Ok(0) => return,
+            Ok(n) => {
+                // `send` fails only if the receiver hung up → nobody's
+                // listening, so we're done.
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    return;
+                }
+            }
+            // No data within the timeout window is normal — keep waiting.
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            // Anything else (typically the device unplugged) ends the stream.
+            Err(e) => {
+                eprintln!("\n[reader] serial read error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Prompt on stdout, return one trimmed line from stdin. `None` on EOF (Ctrl-D).
+fn prompt(label: &str) -> io::Result<Option<String>> {
+    print!("{label}");
+    io::stdout().flush()?;
+
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None); // EOF
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+/// Ask which listed port to open. Empty input defaults to the first one.
+/// Returns the chosen port name, or `None` to quit.
+fn choose_port(ports: &[&SerialPortInfo]) -> io::Result<Option<String>> {
+    loop {
+        let label = if ports.len() == 1 {
+            "\nSelect port [1]: ".to_string()
+        } else {
+            format!("\nSelect port [1-{}]: ", ports.len())
+        };
+
+        let Some(input) = prompt(&label)? else {
+            return Ok(None);
+        };
+
+        let choice = if input.is_empty() {
+            1
+        } else {
+            match input.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("Not a number: {input:?}");
+                    continue;
+                }
+            }
+        };
+
+        if (1..=ports.len()).contains(&choice) {
+            return Ok(Some(ports[choice - 1].port_name.clone()));
+        }
+        eprintln!("Out of range: pick 1-{}.", ports.len());
+    }
+}
+
+/// Ask for a baud rate. Empty input defaults to `DEFAULT_BAUD`.
+fn choose_baud() -> io::Result<Option<u32>> {
+    loop {
+        let Some(input) = prompt(&format!("Baud rate [{DEFAULT_BAUD}]: "))? else {
+            return Ok(None);
+        };
+
+        if input.is_empty() {
+            return Ok(Some(DEFAULT_BAUD));
+        }
+        match input.parse::<u32>() {
+            Ok(b) if b > 0 => return Ok(Some(b)),
+            _ => eprintln!("Enter a positive baud rate (e.g. 9600, 115200)."),
+        }
+    }
 }
 
 /// Is this a phantom legacy UART slot the kernel always exposes even with no
