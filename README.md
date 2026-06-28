@@ -6,46 +6,47 @@
 
 Most serial tools (`picocom`, `minicom`, `cu`, `tio`) make you already *know* the
 port path before you connect. portcall flips that around: **discover → pick →
-connect.** It can even **auto-detect the baud rate** of a device that's sending
-ASCII, so you don't have to guess.
+connect.** It auto-detects the baud rate of ASCII devices so you don't have to guess.
 
-> **Status:** early but working. Port discovery, connect/stream, and auto-baud
-> are implemented and verified on hardware. A full-screen TUI is on the roadmap.
+[![crates.io](https://img.shields.io/crates/v/portcall.svg)](https://crates.io/crates/portcall)
 
 ## Features
 
-- **Port discovery with metadata** — lists serial ports and classifies each
-  (USB / Bluetooth / PCI), showing USB manufacturer, product, and VID:PID so the
-  device is recognizable at a glance.
-- **Phantom-port filtering (Linux)** — hides the kernel's always-present but
-  empty legacy `/dev/ttyS*` UART slots (detected via sysfs), so the list shows
-  only ports that are actually there. Pass `--all` to see everything.
-- **Auto-baud detection** — for ASCII devices, scans common baud rates
-  (9600 → 921600), scores each for readable text, and connects at the best match
-  (`auto: 115200 baud detected`). Binary/raw devices take a manually entered baud.
-- **Live streaming** — opens the port, reads on a background thread, and streams
-  incoming bytes to stdout. Clean shutdown on disconnect.
-- **Direct mode** — `portcall /dev/ttyACM0` opens a known path, skipping the
-  picker.
+- **Full-screen TUI** — three-screen flow: port picker → baud picker → live view.
+  Mouse hover, click, and keyboard navigation throughout.
+- **Port discovery with metadata** — classifies each port (USB / Bluetooth / PCI),
+  shows USB manufacturer, product, and VID:PID so the device is recognizable at a glance.
+  A detail panel shows full device info for the selected port.
+- **Phantom-port filtering (Linux)** — hides empty legacy `/dev/ttyS*` UART slots
+  via sysfs. Pass `--all` to see everything.
+- **Auto-baud detection** — scans 9600 → 921600, scores each baud for readable
+  text structure, and connects at the best match. Manual entry available via tab UI.
+- **Live scroll** — timestamped lines with keyword colour-coding
+  (errors red, warnings yellow, ok/pass/done green). Smart auto-scroll stays at
+  the bottom unless you've scrolled up to read.
+- **Smart pinning** — lines sharing a common prefix that repeat 3× or more are
+  promoted to a persistent side panel and update in place, keeping the live stream
+  clean. ANSI-formatted output bypasses pinning and streams directly.
+- **Direct mode** — `portcall /dev/ttyACM0` opens a known path, skipping discovery.
 
 ## Install
 
-Requires a [Rust toolchain](https://rustup.rs/) (edition 2024).
-
-### Linux build dependency
-
-portcall enumerates ports via **libudev**, so the dev headers are needed at build
-time:
+### From crates.io
 
 ```sh
-# Debian / Ubuntu / Pop!_OS
-sudo apt install libudev-dev pkg-config
+cargo install portcall
 ```
 
-### Build
+> **Linux:** portcall enumerates ports via **libudev**. Install the dev headers
+> before `cargo install` if you don't already have them:
+> ```sh
+> sudo apt install libudev-dev pkg-config   # Debian / Ubuntu / Pop!_OS
+> ```
+
+### From source
 
 ```sh
-git clone <repo-url> portcall
+git clone https://github.com/ChirayuR/Portcall portcall
 cd portcall
 cargo build --release
 # binary at target/release/portcall
@@ -53,67 +54,54 @@ cargo build --release
 
 ## Usage
 
-Run it and follow the prompts:
-
 ```sh
-portcall
+portcall              # discover ports, pick one, connect
+portcall /dev/ttyACM0 # open a specific port directly (skip discovery)
+portcall --all        # include phantom/legacy ttyS* slots in the list
 ```
 
-```
-Found 1 serial port(s):
+The TUI walks you through three screens:
 
-  [1] /dev/ttyACM0
-      USB  STMicroelectronics — STM32 STLink  (VID:PID 0483:374b)
+**1. Port picker** — select a port with ↑↓, hover, or click. A detail panel on
+the right shows the full device description.
 
-Select port [1]: 1
-What is the device sending? [A]SCII text / [B]inary or raw (default A): a
-Auto-detecting baud — the device must be transmitting ASCII now…
-auto: 115200 baud detected.
+**2. Baud picker** — tab between Auto-detect and Manual entry. Auto-detect scans
+all common baud rates and connects at the best match.
 
-Connected to /dev/ttyACM0 @ 115200 baud. Press Ctrl-C to quit.
-STATUS: Logging active
-...
-```
-
-Other forms:
-
-```sh
-portcall /dev/ttyACM0   # open a specific port directly (skip discovery)
-portcall --all          # include phantom/legacy ttyS* slots in the list
-```
+**3. Live view** — scrolling receive window with timestamps and colour-coded
+keywords. Frequently repeated lines are pinned to a side panel and update in place.
 
 > **Note:** auto-baud only works while the device is actively transmitting —
 > there is no deterministic host-side autobaud for plain UART.
 
 ### Permissions (Linux)
 
-Opening a port usually requires membership in the `dialout` group. If you get
-`Permission denied`, add yourself and re-login:
+Opening a port usually requires membership in the `dialout` group:
 
 ```sh
-sudo usermod -aG dialout $USER
+sudo usermod -aG dialout $USER   # then re-login
 ```
 
 ## Platform support
 
-Cross-platform port discovery is provided by the
+Cross-platform port discovery via the
 [`serialport`](https://crates.io/crates/serialport) crate (`COM*` on Windows,
-`/dev/tty*` on Linux, `/dev/cu.*` on macOS). Development and verification so far
-have been on Linux; the phantom-`ttyS` filter is Linux-specific (no-op elsewhere).
+`/dev/tty*` on Linux, `/dev/cu.*` on macOS). Development and hardware verification
+on Linux; the phantom-`ttyS` filter is Linux-specific (no-op elsewhere).
 
 ## Roadmap
 
-- Full-screen TUI: navigable port list + scrolling receive view.
-- Sending (TX) a line back to the device.
+- TX line — type and send text back to the device.
+- Improved baud scoring — line-structure and high-byte-density checks.
 - Reconnect handling and configurable line endings.
-- Remember the last-used port and baud.
+- Remember last-used port and baud across sessions.
 
 ## How it works
 
-A background **reader thread** owns the open port and pushes received bytes over
-an `mpsc` channel to the main thread (producer/consumer). Core concerns (port
-discovery, the `Connection`) are kept free of any UI dependency so a TUI can be
-layered on without touching them.
+A background **reader thread** owns the open serial port and pushes received bytes
+over an `mpsc` channel to the UI thread (producer/consumer). The core connection
+logic is kept free of TUI dependencies so it can be extracted into a library crate
+later without touching the serial logic.
 
 ## License
 
@@ -123,7 +111,3 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
