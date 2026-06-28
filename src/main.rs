@@ -1,5 +1,4 @@
 use serialport::{ClearBuffer, SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
-use std::collections::HashMap;
 use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +23,8 @@ const DETECT_THRESHOLD: f32 = 0.85;
 const PIN_THRESHOLD: usize = 3;
 /// Maximum pinned entries shown simultaneously.
 const MAX_PINS_DISPLAY: usize = 8;
+/// Minimum shared byte-prefix length for two lines to be considered the same "field".
+const LCP_THRESHOLD: usize = 6;
 
 /// Signal all background threads to exit, then request the TUI to shut down.
 fn request_quit(code: u8) {
@@ -743,12 +744,16 @@ fn render_live_line(ctx: &mut LiveCtx, index: usize) -> Option<Box<dyn Widget>> 
     Some(Text::new().content(s) as Box<dyn Widget>)
 }
 
-/// A line promoted out of the live scroll because it repeats above `PIN_THRESHOLD`.
-struct Pinned {
-    text: String,
+/// Tracks a group of lines that share a common prefix (same "field", varying value).
+/// Once `count` reaches `PIN_THRESHOLD` the group is pinned and `latest` updates in place.
+struct LineGroup {
+    /// Longest common byte-prefix across all lines seen in this group (shrinks as values vary).
+    prefix: String,
+    /// Most recent full line from this group.
+    latest: String,
     count: usize,
-    #[allow(dead_code)]
     last_seen: Instant,
+    pinned: bool,
 }
 
 /// Third TUI screen: streams and displays incoming serial data.
@@ -760,9 +765,7 @@ struct RxScreen {
     live_list_id: WidgetId<List>,
     pinned_id: WidgetId<Text>,
     status_id: WidgetId<Text>,
-    // Pinning state — kept here to avoid borrow conflicts with the List context
-    pins: Vec<Pinned>,
-    frequency: HashMap<String, usize>,
+    groups: Vec<LineGroup>,
     partial: Vec<u8>,
     total_bytes: u64,
     start_time: Instant,
@@ -799,8 +802,7 @@ impl RxScreen {
 
         let mut screen = Box::new(Self {
             root, live_list_id, pinned_id, status_id,
-            pins: Vec::new(),
-            frequency: HashMap::new(),
+            groups: Vec::new(),
             partial: Vec::new(),
             total_bytes: 0,
             start_time,
@@ -811,14 +813,14 @@ impl RxScreen {
         screen
     }
 
-    /// Feed a raw chunk: extract lines, pin recurring ones, refresh both panels.
+    /// Feed a raw chunk: extract lines, group by LCP, pin recurring groups, refresh panels.
     fn feed_bytes(&mut self, bytes: Vec<u8>) {
         self.total_bytes += bytes.len() as u64;
         self.partial.extend_from_slice(&bytes);
 
         let now = Instant::now();
         let mut new_live: Vec<LiveLine> = Vec::new();
-        let mut newly_pinned: Vec<String> = Vec::new();
+        let mut newly_pinned_prefixes: Vec<String> = Vec::new();
         let mut pins_changed = false;
 
         while let Some(nl) = self.partial.iter().position(|&b| b == b'\n') {
@@ -830,37 +832,65 @@ impl RxScreen {
                 continue;
             }
 
-            let freq = self.frequency.entry(text.clone()).or_insert(0);
-            *freq += 1;
-            let f = *freq;
+            // ANSI lines bypass grouping entirely — escape sequences make every
+            // frame unique and render as garbage if pinned.
+            if text.contains('\x1b') {
+                new_live.push(LiveLine { text, ts: now });
+                continue;
+            }
 
-            if let Some(pin) = self.pins.iter_mut().find(|p| p.text == text) {
-                pin.count = f;
-                pin.last_seen = now;
-                pins_changed = true;
-            } else if f >= PIN_THRESHOLD && !self.pins.iter().any(|p| p.text == text) {
-                // First crossing of threshold — promote to pinned
-                self.pins.push(Pinned { text: text.clone(), count: f, last_seen: now });
-                newly_pinned.push(text.clone());
-                pins_changed = true;
+            // Find the group whose prefix shares the longest common prefix with
+            // this line, requiring at least LCP_THRESHOLD bytes to match.
+            let best = self.groups
+                .iter()
+                .enumerate()
+                .filter_map(|(i, g)| {
+                    let lcp = common_prefix_len(&g.prefix, &text);
+                    if lcp >= LCP_THRESHOLD { Some((i, lcp)) } else { None }
+                })
+                .max_by_key(|&(_, lcp)| lcp)
+                .map(|(i, _)| i);
+
+            if let Some(gi) = best {
+                let g = &mut self.groups[gi];
+                let lcp = common_prefix_len(&g.prefix, &text);
+                g.prefix.truncate(lcp); // shrink prefix to actual shared region
+                g.latest = text.clone();
+                g.count += 1;
+                g.last_seen = now;
+
+                if g.pinned {
+                    pins_changed = true; // update display; suppress from live
+                } else if g.count >= PIN_THRESHOLD {
+                    g.pinned = true;
+                    newly_pinned_prefixes.push(g.prefix.clone());
+                    pins_changed = true;
+                } else {
+                    new_live.push(LiveLine { text, ts: now });
+                }
             } else {
+                self.groups.push(LineGroup {
+                    prefix: text.clone(),
+                    latest: text.clone(),
+                    count: 1,
+                    last_seen: now,
+                    pinned: false,
+                });
                 new_live.push(LiveLine { text, ts: now });
             }
         }
 
-        // Apply to the live List widget (no borrows held from above)
         let live_count = {
             let Some(list) = self.root.get_widget_mut(self.live_list_id) else {
                 return;
             };
-            // Only auto-scroll if the user was already at the bottom before new data.
             let old_count = self.live_count;
             let was_at_bottom = old_count == 0 || list.get_visible_range().end >= old_count;
 
             let ctx = list.get_context_mut::<LiveCtx>().expect("live ctx");
-            // Remove previously queued lines that just got promoted
-            for pinned_text in &newly_pinned {
-                ctx.lines.retain(|l| &l.text != pinned_text);
+            // Purge pre-threshold occurrences of newly pinned groups from live.
+            for prefix in &newly_pinned_prefixes {
+                ctx.lines.retain(|l| common_prefix_len(&l.text, prefix) < LCP_THRESHOLD);
             }
             ctx.lines.extend(new_live);
             let n = ctx.lines.len();
@@ -868,7 +898,7 @@ impl RxScreen {
             if was_at_bottom && n > 0 {
                 list.ensure_visible(n - 1);
             }
-            if !newly_pinned.is_empty() {
+            if !newly_pinned_prefixes.is_empty() {
                 list.invalidate_all();
             }
             n
@@ -881,24 +911,27 @@ impl RxScreen {
         self.update_status();
     }
 
-    /// Rebuild the pinned panel Text.
+    /// Rebuild the pinned panel Text from all pinned groups (showing latest value each).
     fn update_pinned(&mut self) {
-        let content: StyledString = if self.pins.is_empty() {
+        let pinned: Vec<(&str, usize)> = self.groups
+            .iter()
+            .filter(|g| g.pinned)
+            .map(|g| (g.latest.as_str(), g.count))
+            .collect();
+
+        let content: StyledString = if pinned.is_empty() {
             let mut s = StyledString::new();
             s.push_span("\n  no pins yet\n\n  lines seen ≥3×\n  appear here".dim());
             s
         } else {
             let mut s = StyledString::new();
-            let show = self.pins.len().min(MAX_PINS_DISPLAY);
-            for pin in &self.pins[..show] {
-                let badge = format!(" ×{:<3}", pin.count);
-                let msg   = format!("  {}\n", pin.text);
-                s.push_span(badge.as_str().cyan().bold());
-                s.push_span(msg.as_str().dim());
+            let show = pinned.len().min(MAX_PINS_DISPLAY);
+            for &(text, count) in &pinned[..show] {
+                s.push_span(format!(" ×{count:<3}  ").as_str().cyan().bold());
+                s.push_span(format!("{text}\n").as_str().dim());
             }
-            if self.pins.len() > MAX_PINS_DISPLAY {
-                let extra = format!("  … {} more\n", self.pins.len() - MAX_PINS_DISPLAY);
-                s.push_span(extra.as_str().dim());
+            if pinned.len() > MAX_PINS_DISPLAY {
+                s.push_span(format!("  … {} more\n", pinned.len() - MAX_PINS_DISPLAY).as_str().dim());
             }
             s
         };
@@ -911,7 +944,7 @@ impl RxScreen {
     fn update_status(&mut self) {
         let live_str    = format!("{}", self.live_count);
         let bytes_str   = format_bytes(self.total_bytes);
-        let pinned_str  = format!("{}", self.pins.len());
+        let pinned_str  = format!("{}", self.groups.iter().filter(|g| g.pinned).count());
         let elapsed_str = format_duration(self.start_time.elapsed().as_secs());
 
         let mut s = StyledString::new();
@@ -1111,6 +1144,12 @@ fn line_color(text: &str) -> Color {
     } else {
         Color::Foreground
     }
+}
+
+/// Byte-level common prefix length between two strings.
+/// Using bytes (not chars) is correct for ASCII MCU output and avoids UTF-8 splits.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 fn format_bytes(n: u64) -> String {

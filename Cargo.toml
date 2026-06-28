@@ -1,6 +1,6 @@
 [package]
 name = "portcall"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 authors = ["Chirayu Rankawat <chirayurankawat@gmail.com>"]
 description = "A terminal serial monitor that discovers ports, lets you pick from a list, and auto-detects baud."
