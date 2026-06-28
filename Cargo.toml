@@ -12,3 +12,4 @@ categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 serialport = "4.9.0"
+tuie = { version = "0.2.4", features = ["harmonious"] }
