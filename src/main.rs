@@ -127,6 +127,7 @@ fn reader_loop(mut port: Box<dyn SerialPort>, tx: mpsc::Sender<Vec<u8>>) {
 // ---------- Port metadata ----------
 
 /// Broad category of a serial port's physical interface.
+#[derive(Clone)]
 enum PortKind {
     Usb,
     Bluetooth,
@@ -195,20 +196,16 @@ fn render_port(ctx: &mut PortPickerCtx, idx: usize) -> Option<Box<dyn Widget>> {
         (PortKind::Unknown,   _)     => s.push_span(badge.dim()),
     }
 
-    s.push_str("  ");
-
-    let desc = entry.desc.as_str();
-    if sel { s.push_str(desc); } else { s.push_span(desc.dim()); }
-
     Some(Text::new().content(s) as Box<dyn Widget>)
 }
 
-/// First TUI screen: interactive port list.
+/// First TUI screen: interactive port list with a detail panel.
+/// Left pane: navigable port list. Right pane: full device info for the selected port.
 /// Sets `selected_port` when the user presses Enter (or mouse click); `App` transitions to baud.
-/// Mouse hover highlights the item under the cursor; click selects it.
 struct PortPickerScreen {
     root: Box<Pane>,
     list_id: WidgetId<List>,
+    detail_id: WidgetId<Text>,
     port_count: usize,
     selected_port: Option<String>,
 }
@@ -217,24 +214,68 @@ impl PortPickerScreen {
     fn new(ports: Vec<PortEntry>) -> Box<Self> {
         let port_count = ports.len();
         let mut list_id = WidgetId::EMPTY;
+        let mut detail_id = WidgetId::EMPTY;
 
         let mut list = List::new();
         list.set_renderer(PortPickerCtx { ports, selected: 0 }, render_port);
         list.set_item_count(port_count);
 
-        let title = styled_title(" portcall — select a port ");
-        let footer = styled_footer("  ↑↓ navigate   Enter select   q quit");
+        let detail = Text::new().word_wrap().content("").id(&mut detail_id);
 
-        let content = Pane::new()
-            .border(Border::SINGLE)
-            .child(list.id(&mut list_id).flex(1));
+        let split = Split::new(
+            SplitPane::new().horizontal().children([
+                SplitPaneChild::from(list.id(&mut list_id).flex(1))
+                    .title(" portcall "),
+                SplitPaneChild::from(detail.flex(2))
+                    .title(" device "),
+            ]),
+        );
+
+        let footer = styled_footer("  ↑↓ / hover  navigate   Enter / click  select   q quit");
 
         let root = Pane::new()
-            .child(title)
-            .child(content.flex(1))
+            .child(split.flex(1))
             .child(footer);
 
-        Box::new(Self { root, list_id, port_count, selected_port: None })
+        let mut screen = Box::new(Self { root, list_id, detail_id, port_count, selected_port: None });
+        screen.update_detail();
+        screen
+    }
+
+    fn update_detail(&mut self) {
+        let info = {
+            let Some(list) = self.root.get_widget_mut(self.list_id) else { return; };
+            let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
+            ctx.ports.get(ctx.selected).map(|e| (e.name.clone(), e.kind.clone(), e.desc.clone()))
+        };
+
+        let content: StyledString = match info {
+            None => {
+                let mut s = StyledString::new();
+                s.push_span("\n  No devices found.".dim());
+                s
+            }
+            Some((name, kind, desc)) => {
+                let mut s = StyledString::new();
+                s.push_str("\n");
+                s.push_span(format!("  {name}\n\n").as_str().bold());
+                s.push_span("  Type   ".dim());
+                let (kind_str, color) = match kind {
+                    PortKind::Usb       => ("USB",       Color::CYAN),
+                    PortKind::Bluetooth => ("Bluetooth", Color::BLUE),
+                    PortKind::Pci       => ("PCI",       Color::YELLOW),
+                    PortKind::Unknown   => ("Unknown",   Color::Foreground),
+                };
+                s.push_span(kind_str.fg(color).bold());
+                s.push_str("\n\n");
+                s.push_span(format!("  {desc}\n").as_str().dim());
+                s
+            }
+        };
+
+        if let Some(w) = self.root.get_widget_mut(self.detail_id) {
+            w.set_content(content);
+        }
     }
 }
 
@@ -253,21 +294,34 @@ impl DelegateWidget for PortPickerScreen {
         }
 
         // Mouse hover → highlight the item under the cursor.
-        // Row 0 = title, row 1 = border-top, rows 2+ = list items.
+        // Row 0 = split pane border-top, rows 1+ = list items.
         if matches!(ev.chord.trigger, Trigger::MouseHover) {
             let row = ev.cell().y;
             let n = self.port_count;
-            if row >= 2 && n > 0 {
-                let item = (row - 2) as usize;
+            if row >= 1 && n > 0 {
+                let item = (row - 1) as usize;
                 if item < n {
                     queue.next();
-                    if let Some(list) = self.root.get_widget_mut(self.list_id) {
-                        let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
-                        if ctx.selected != item {
+                    let changed = {
+                        let Some(list) = self.root.get_widget_mut(self.list_id) else {
+                            return InputResult::Handled;
+                        };
+                        let old = {
+                            let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
+                            let old = ctx.selected;
                             ctx.selected = item;
+                            old
+                        };
+                        if old != item {
                             list.ensure_visible(item);
                             list.invalidate_all();
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if changed {
+                        self.update_detail();
                     }
                     return InputResult::Handled;
                 }
@@ -278,8 +332,8 @@ impl DelegateWidget for PortPickerScreen {
         if let Trigger::MouseDown(MouseButton::Left) = ev.chord.trigger {
             let row = ev.cell().y;
             let n = self.port_count;
-            if row >= 2 && n > 0 {
-                let item = (row - 2) as usize;
+            if row >= 1 && n > 0 {
+                let item = (row - 1) as usize;
                 if item < n {
                     queue.next();
                     let selected = {
@@ -305,18 +359,23 @@ impl DelegateWidget for PortPickerScreen {
             queue.next();
             let n = self.port_count;
             if n > 0 {
-                let Some(list) = self.root.get_widget_mut(self.list_id) else {
-                    return InputResult::Handled;
-                };
-                let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
-                ctx.selected = if up {
-                    ctx.selected.saturating_sub(1)
-                } else {
-                    (ctx.selected + 1).min(n - 1)
-                };
-                let s = ctx.selected;
-                list.ensure_visible(s);
-                list.invalidate_all();
+                {
+                    let Some(list) = self.root.get_widget_mut(self.list_id) else {
+                        return InputResult::Handled;
+                    };
+                    let s = {
+                        let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
+                        ctx.selected = if up {
+                            ctx.selected.saturating_sub(1)
+                        } else {
+                            (ctx.selected + 1).min(n - 1)
+                        };
+                        ctx.selected
+                    };
+                    list.ensure_visible(s);
+                    list.invalidate_all();
+                }
+                self.update_detail();
             }
             return InputResult::Handled;
         }
@@ -366,10 +425,10 @@ impl BaudPickerScreen {
         let mut footer_id = WidgetId::EMPTY;
 
         let title_str = format!(" portcall — {port} ");
-        let title = styled_title(&title_str);
 
         let content_area = Pane::new()
             .border(Border::SINGLE)
+            .title(title_str)
             .child(
                 Text::new()
                     .word_wrap()
@@ -382,7 +441,6 @@ impl BaudPickerScreen {
             .id(&mut footer_id);
 
         let root = Pane::new()
-            .child(title)
             .child(content_area.flex(1))
             .child(footer);
 
@@ -695,11 +753,8 @@ struct Pinned {
 
 /// Third TUI screen: streams and displays incoming serial data.
 ///
-/// Layout (top to bottom):
-/// - Reverse/bold title bar (`port @ baud`)
-/// - Pinned panel: plain `Text`, hidden (height 0) when empty, grows per promoted line
-/// - Live scroll: bordered `List` with timestamps and colour-coding (flex:1)
-/// - Dim status bar: live count, byte total, pinned count, uptime, scroll hint
+/// Layout: horizontal Split — live scroll (left, flex 3) | pinned panel (right, flex 1).
+/// Title embedded in the live pane's border. Status bar below the Split.
 struct RxScreen {
     root: Box<Pane>,
     live_list_id: WidgetId<List>,
@@ -720,26 +775,26 @@ impl RxScreen {
         let mut pinned_id = WidgetId::EMPTY;
         let mut status_id = WidgetId::EMPTY;
 
-        let title_str = format!(" portcall — {port} @ {baud} baud ");
-        let title = styled_title(&title_str);
-
-        // Empty content → height 0 → invisible until the first pin is promoted.
-        let pinned = Text::new().content("").id(&mut pinned_id);
-
         let start_time = Instant::now();
         let mut list = List::new();
         list.set_renderer(LiveCtx { lines: Vec::new(), start_time }, render_live_line);
 
-        let live_pane = Pane::new()
-            .border(Border::SINGLE)
-            .child(list.id(&mut live_list_id).flex(1));
+        let pinned = Text::new().word_wrap().content("").id(&mut pinned_id);
+
+        let live_title = format!(" live — {port} @ {baud} baud ");
+        let split = Split::new(
+            SplitPane::new().horizontal().children([
+                SplitPaneChild::from(list.id(&mut live_list_id).flex(3))
+                    .title(live_title),
+                SplitPaneChild::from(pinned.flex(1))
+                    .title(" pinned "),
+            ]),
+        );
 
         let status = Text::new().content("").id(&mut status_id);
 
         let root = Pane::new()
-            .child(title)
-            .child(pinned)
-            .child(live_pane.flex(1))
+            .child(split.flex(1))
             .child(status);
 
         let mut screen = Box::new(Self {
@@ -751,6 +806,7 @@ impl RxScreen {
             start_time,
             live_count: 0,
         });
+        screen.update_pinned();
         screen.update_status();
         screen
     }
@@ -826,23 +882,22 @@ impl RxScreen {
     }
 
     /// Rebuild the pinned panel Text.
-    /// Empty StyledString → height 0 → widget invisible.
     fn update_pinned(&mut self) {
         let content: StyledString = if self.pins.is_empty() {
-            StyledString::new()
+            let mut s = StyledString::new();
+            s.push_span("\n  no pins yet\n\n  lines seen ≥3×\n  appear here".dim());
+            s
         } else {
             let mut s = StyledString::new();
-            s.push_span(" ── pinned messages ".dim());
-
             let show = self.pins.len().min(MAX_PINS_DISPLAY);
             for pin in &self.pins[..show] {
-                let badge = format!("\n ×{:<3}", pin.count);
-                let msg   = format!("  {}", pin.text);
+                let badge = format!(" ×{:<3}", pin.count);
+                let msg   = format!("  {}\n", pin.text);
                 s.push_span(badge.as_str().cyan().bold());
                 s.push_span(msg.as_str().dim());
             }
             if self.pins.len() > MAX_PINS_DISPLAY {
-                let extra = format!("\n  … {} more pinned", self.pins.len() - MAX_PINS_DISPLAY);
+                let extra = format!("  … {} more\n", self.pins.len() - MAX_PINS_DISPLAY);
                 s.push_span(extra.as_str().dim());
             }
             s
@@ -1024,13 +1079,6 @@ fn run_tui(ports: Vec<PortEntry>) -> io::Result<ExitCode> {
 }
 
 // ---------- Display helpers ----------
-
-/// Build a reverse-video bold `Text` widget for use as a title bar.
-fn styled_title(text: &str) -> Box<Text> {
-    let mut s = StyledString::new();
-    s.push_span(text.reverse().bold());
-    Text::new().content(s)
-}
 
 /// Build a dim `StyledString` for footer / status hints.
 fn styled_footer_str(text: &str) -> StyledString {
