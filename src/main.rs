@@ -2,10 +2,14 @@ use serialport::{ClearBuffer, SerialPort, SerialPortInfo, SerialPortType, UsbPor
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tuie::prelude::*;
+
+/// Set on quit so background threads (reader, scan) can exit without waiting for their timeout.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const READ_BUF: usize = 1024;
@@ -20,6 +24,12 @@ const DETECT_THRESHOLD: f32 = 0.85;
 const PIN_THRESHOLD: usize = 3;
 /// Maximum pinned entries shown simultaneously.
 const MAX_PINS_DISPLAY: usize = 8;
+
+/// Signal all background threads to exit, then request the TUI to shut down.
+fn request_quit(code: u8) {
+    QUITTING.store(true, Ordering::Relaxed);
+    tuie::quit(code);
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -98,9 +108,16 @@ fn reader_loop(mut port: Box<dyn SerialPort>, tx: mpsc::Sender<Vec<u8>>) {
                     return;
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                if QUITTING.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
             Err(e) => {
-                eprintln!("\n[reader] serial read error: {e}");
+                // Suppress errors caused by the port being closed on normal exit.
+                if !QUITTING.load(Ordering::Relaxed) {
+                    eprintln!("\n[reader] serial read error: {e}");
+                }
                 return;
             }
         }
@@ -187,7 +204,8 @@ fn render_port(ctx: &mut PortPickerCtx, idx: usize) -> Option<Box<dyn Widget>> {
 }
 
 /// First TUI screen: interactive port list.
-/// Sets `selected_port` when the user presses Enter; `App` transitions to baud.
+/// Sets `selected_port` when the user presses Enter (or mouse click); `App` transitions to baud.
+/// Mouse hover highlights the item under the cursor; click selects it.
 struct PortPickerScreen {
     root: Box<Pane>,
     list_id: WidgetId<List>,
@@ -230,8 +248,56 @@ impl DelegateWidget for PortPickerScreen {
 
         if ev.chord == chord!(q) || ev.chord == chord!(Ctrl + c) {
             queue.next();
-            tuie::quit(0);
+            request_quit(0);
             return InputResult::Handled;
+        }
+
+        // Mouse hover → highlight the item under the cursor.
+        // Row 0 = title, row 1 = border-top, rows 2+ = list items.
+        if matches!(ev.chord.trigger, Trigger::MouseHover) {
+            let row = ev.cell().y;
+            let n = self.port_count;
+            if row >= 2 && n > 0 {
+                let item = (row - 2) as usize;
+                if item < n {
+                    queue.next();
+                    if let Some(list) = self.root.get_widget_mut(self.list_id) {
+                        let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
+                        if ctx.selected != item {
+                            ctx.selected = item;
+                            list.ensure_visible(item);
+                            list.invalidate_all();
+                        }
+                    }
+                    return InputResult::Handled;
+                }
+            }
+        }
+
+        // Mouse click → select the item and confirm (same as Enter).
+        if let Trigger::MouseDown(MouseButton::Left) = ev.chord.trigger {
+            let row = ev.cell().y;
+            let n = self.port_count;
+            if row >= 2 && n > 0 {
+                let item = (row - 2) as usize;
+                if item < n {
+                    queue.next();
+                    let selected = {
+                        let Some(list) = self.root.get_widget_mut(self.list_id) else {
+                            return InputResult::Handled;
+                        };
+                        let name = {
+                            let ctx = list.get_context_mut::<PortPickerCtx>().unwrap();
+                            ctx.selected = item;
+                            ctx.ports.get(item).map(|e| e.name.clone())
+                        };
+                        list.invalidate_all();
+                        name
+                    };
+                    self.selected_port = selected;
+                    return InputResult::Handled;
+                }
+            }
         }
 
         if ev.chord == chord!(Up) || ev.chord == chord!(Down) {
@@ -277,7 +343,7 @@ impl DelegateWidget for PortPickerScreen {
 /// State machine for the baud-resolution flow.
 enum BaudPhase {
     Prompt,
-    Scanning { lines: Vec<String> },
+    Scanning { lines: Vec<StyledString> },
     Manual { input: String },
     Done(u32),
 }
@@ -290,6 +356,8 @@ struct BaudPickerScreen {
     phase: BaudPhase,
     resolved: Option<u32>,
     wants_scan: bool,
+    /// Tab-bar selection in the Prompt phase: 0 = Auto-detect, 1 = Manual.
+    tab: usize,
 }
 
 impl BaudPickerScreen {
@@ -305,12 +373,12 @@ impl BaudPickerScreen {
             .child(
                 Text::new()
                     .word_wrap()
-                    .content(Self::prompt_text())
+                    .content(Self::prompt_tabs(0))
                     .id(&mut content_id),
             );
 
         let footer = Text::new()
-            .content(styled_footer_str("  A auto-detect   B manual baud   q quit"))
+            .content(styled_footer_str("  ← → Tab switch   Enter confirm   q quit"))
             .id(&mut footer_id);
 
         let root = Pane::new()
@@ -322,26 +390,44 @@ impl BaudPickerScreen {
             root, content_id, footer_id,
             port, phase: BaudPhase::Prompt,
             resolved: None, wants_scan: false,
+            tab: 0,
         })
     }
 
-    fn prompt_text() -> &'static str {
-        "Device must be transmitting ASCII text for auto-detection.\n\
-         \n\
-         Press A  to auto-detect baud rate\n\
-         Press B  to enter baud rate manually\n\
-         Or start typing the baud rate directly."
+    /// Build the tab-bar StyledString for the Prompt phase.
+    fn prompt_tabs(selected: usize) -> StyledString {
+        let mut s = StyledString::new();
+        // Tab 0 — Auto-detect
+        if selected == 0 {
+            s.push_span("  Auto-detect  ".bold().reverse());
+        } else {
+            s.push_span("  Auto-detect  ".dim());
+        }
+        s.push_str("   ");
+        // Tab 1 — Manual baud
+        if selected == 1 {
+            s.push_span("  Manual baud  ".bold().reverse());
+        } else {
+            s.push_span("  Manual baud  ".dim());
+        }
+        s.push_str("\n\n");
+        if selected == 0 {
+            s.push_span("Device must be transmitting ASCII text for auto-detection.".dim());
+        } else {
+            s.push_span("Type the baud rate and press Enter.".dim());
+        }
+        s
     }
 
     fn update_content(&mut self) {
         let text: StyledString = match &self.phase {
-            BaudPhase::Prompt => Self::prompt_text().into(),
+            BaudPhase::Prompt => Self::prompt_tabs(self.tab),
             BaudPhase::Scanning { lines } => {
                 let mut s = StyledString::new();
                 s.push_span("Scanning baud rates…\n\n".bold());
                 s.push_span("    baud      score\n".dim());
                 for l in lines {
-                    s.push_str(l);
+                    s.append(l);
                     s.push_str("\n");
                 }
                 s
@@ -369,7 +455,7 @@ impl BaudPickerScreen {
 
     fn update_footer(&mut self) {
         let msg = match &self.phase {
-            BaudPhase::Prompt     => "  A auto-detect   B manual baud   q quit",
+            BaudPhase::Prompt     => "  ← → Tab switch   Enter confirm   q quit",
             BaudPhase::Scanning { .. } => "  Scanning…   q quit",
             BaudPhase::Manual { .. }   => "  0–9 type baud   Backspace   Enter confirm   q quit",
             BaudPhase::Done(_)         => "  Connecting…",
@@ -386,12 +472,21 @@ impl DelegateWidget for BaudPickerScreen {
     fn override_on_event(&mut self, event: &mut WidgetEvent) {
         if let Some(update) = event.take::<ScanUpdate>() {
             if let BaudPhase::Scanning { lines } = &mut self.phase {
-                let bar = score_bar(update.score);
-                let best = if update.score >= DETECT_THRESHOLD { "  ← best" } else { "" };
-                lines.push(format!(
-                    "  {:>7}  {}  {:.2}{}",
-                    update.rate, bar, update.score, best
-                ));
+                let (filled, empty) = score_bar_parts(update.score);
+                let hit = update.score >= DETECT_THRESHOLD;
+                let rate_str = format!("  {:>7}  ", update.rate);
+                let score_str = format!("  {:.2}", update.score);
+                let mut line = StyledString::new();
+                line.push_span(rate_str.as_str().dim());
+                line.push_span(filled.as_str().cyan());
+                line.push_span(empty.as_str().dim());
+                if hit {
+                    line.push_span(score_str.as_str().green().bold());
+                    line.push_span("  ← best".green().bold());
+                } else {
+                    line.push_span(score_str.as_str().dim());
+                }
+                lines.push(line);
                 self.update_content();
             }
             return;
@@ -423,13 +518,41 @@ impl DelegateWidget for BaudPickerScreen {
 
         if ev.chord == chord!(q) || ev.chord == chord!(Ctrl + c) {
             queue.next();
-            tuie::quit(0);
+            request_quit(0);
             return InputResult::Handled;
         }
 
         match &self.phase {
             BaudPhase::Prompt => {
-                if ev.chord == chord!(a) || ev.chord == chord!(Enter) {
+                // Tab / Right — advance selection
+                if ev.chord == chord!(Tab) || ev.chord == chord!(Right) {
+                    queue.next();
+                    self.tab = (self.tab + 1).min(1);
+                    self.update_content();
+                    return InputResult::Handled;
+                }
+                // Left — retreat selection
+                if ev.chord == chord!(Left) {
+                    queue.next();
+                    self.tab = self.tab.saturating_sub(1);
+                    self.update_content();
+                    return InputResult::Handled;
+                }
+                // Enter — confirm current tab
+                if ev.chord == chord!(Enter) {
+                    queue.next();
+                    if self.tab == 0 {
+                        self.phase = BaudPhase::Scanning { lines: Vec::new() };
+                        self.wants_scan = true;
+                    } else {
+                        self.phase = BaudPhase::Manual { input: String::new() };
+                    }
+                    self.update_content();
+                    self.update_footer();
+                    return InputResult::Handled;
+                }
+                // Letter shortcuts kept as convenience
+                if ev.chord == chord!(a) {
                     queue.next();
                     self.phase = BaudPhase::Scanning { lines: Vec::new() };
                     self.wants_scan = true;
@@ -444,6 +567,7 @@ impl DelegateWidget for BaudPickerScreen {
                     self.update_footer();
                     return InputResult::Handled;
                 }
+                // Digit — jump straight to manual entry with that digit pre-filled
                 if let Trigger::Key(Key::Char(c)) = ev.chord.trigger {
                     if c.is_ascii_digit() {
                         queue.next();
@@ -673,6 +797,10 @@ impl RxScreen {
             let Some(list) = self.root.get_widget_mut(self.live_list_id) else {
                 return;
             };
+            // Only auto-scroll if the user was already at the bottom before new data.
+            let old_count = self.live_count;
+            let was_at_bottom = old_count == 0 || list.get_visible_range().end >= old_count;
+
             let ctx = list.get_context_mut::<LiveCtx>().expect("live ctx");
             // Remove previously queued lines that just got promoted
             for pinned_text in &newly_pinned {
@@ -681,7 +809,7 @@ impl RxScreen {
             ctx.lines.extend(new_live);
             let n = ctx.lines.len();
             list.set_item_count(n);
-            if n > 0 {
+            if was_at_bottom && n > 0 {
                 list.ensure_visible(n - 1);
             }
             if !newly_pinned.is_empty() {
@@ -765,7 +893,7 @@ impl DelegateWidget for RxScreen {
         if let Some(ev) = queue.peek() {
             if ev.chord == chord!(q) || ev.chord == chord!(Ctrl + c) {
                 queue.next();
-                tuie::quit(0);
+                request_quit(0);
                 return InputResult::Handled;
             }
         }
@@ -854,7 +982,7 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("error: failed to open {port} @ {baud}: {e}");
-                tuie::quit(1);
+                request_quit(1);
                 return;
             }
         };
@@ -916,11 +1044,11 @@ fn styled_footer(text: &str) -> Box<Text> {
     Text::new().content(styled_footer_str(text))
 }
 
-/// 20-char `█░` progress bar for a score in [0, 1].
-fn score_bar(score: f32) -> String {
+/// 20-char `█░` progress bar; returns (filled_chars, empty_chars) for independent styling.
+fn score_bar_parts(score: f32) -> (String, String) {
     let filled = (score.clamp(0.0, 1.0) * 20.0).round() as usize;
     let empty = 20usize.saturating_sub(filled);
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+    ("█".repeat(filled), "░".repeat(empty))
 }
 
 /// Colour for a live serial line based on keyword scanning.
@@ -956,6 +1084,9 @@ fn read_window<R: io::Read + ?Sized>(port: &mut R, window: Duration) -> Vec<u8> 
     let mut out = Vec::new();
     let mut buf = [0u8; 256];
     while Instant::now() < deadline && out.len() < DETECT_MAX_BYTES {
+        if QUITTING.load(Ordering::Relaxed) {
+            break;
+        }
         match port.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => out.extend_from_slice(&buf[..n]),
